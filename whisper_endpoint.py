@@ -12,7 +12,7 @@
 #     -F "wav=@jfk_asknot.wav" -F "language=en"
 #
 # To test (Kinyarwanda model):
-#   curl -X POST "https://xxxxx--whisper-endpoint-transcriber-transcribe.modal.run?model_key=sw" \
+#   curl -X POST "https://xxxxx--whisper-endpoint-transcriber-transcribe.modal.run?model_key=rw" \
 #     -F "wav=@some_kinyarwanda_clip.wav" -F "language=sw"
 #
 # Requires: huggingface-secret configured in Modal!
