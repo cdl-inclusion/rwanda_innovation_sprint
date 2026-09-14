@@ -1,19 +1,20 @@
 # Deploys a FASTAPI endpoint for Whisper models (via FasterWhisper) on Modal GPUs.
 # Serves BOTH CDLI Rwandan fine-tunes (English + Kinyarwanda) from a single
-# deployed class, selected at request time via the `model_key` query
-# parameter. This avoids duplicating the image/conversion/transcription code
-# per language.
+# deployed class. Each container loads both models at startup; the `language`
+# form field of the request picks the model (see LANGUAGES):
+#   language=ky -> Kinyarwanda model, decoded with Whisper's `sw` setting
+#   language=en -> Rwandan English model, decoded with `en`
 #
 # To deploy:
 #   modal deploy whisper_endpoint.py
 #
-# To test (Rwandan English model):
-#   curl -X POST "https://xxxxx--whisper-endpoint-transcriber-transcribe.modal.run?model_key=en" \
-#     -F "wav=@jfk_asknot.wav" -F "language=en"
+# To test (Kinyarwanda):
+#   curl -X POST "https://cdli-hackathons--whisper-endpoint-transcriber-transcribe.modal.run" \
+#     -F "wav=@some_kinyarwanda_clip.wav" -F "language=ky"
 #
-# To test (Kinyarwanda model):
-#   curl -X POST "https://xxxxx--whisper-endpoint-transcriber-transcribe.modal.run?model_key=rw" \
-#     -F "wav=@some_kinyarwanda_clip.wav" -F "language=sw"
+# To test (Rwandan English):
+#   curl -X POST "https://cdli-hackathons--whisper-endpoint-transcriber-transcribe.modal.run" \
+#     -F "wav=@jfk_asknot.wav" -F "language=en"
 #
 # Requires: huggingface-secret configured in Modal!
 
@@ -31,12 +32,14 @@ GPU = 'L4'
 SCALEDOWN = 60 * 2  # seconds
 
 # --- Language registry -------------------------------------------------
+# API language code -> (HF model repo, language code Whisper decodes with).
+# Kinyarwanda has no Whisper language code; the model was fine-tuned and must
+# be decoded with `sw` (the closest language Whisper supports).
 # Add a new language here (one line) rather than a new class/file.
-MODEL_REGISTRY = {
-    "en": "ElizabethMwangi/whisper-large-v3_finetuned_rwandan_english_nonstandard_speech_v1.0",
-    "rw": "ElizabethMwangi/whisper-large-v3_finetuned_kinyarwanda_nonstandard_speech_v1.0",
+LANGUAGES = {
+    "ky": ("cdli/whisper-large-v3_finetuned_kinyarwanda_nonstandard_speech_v1.0", "sw"),
+    "en": ("cdli/whisper-large-v3_finetuned_rwandan_english_nonstandard_speech_v1.0", "en"),
 }
-DEFAULT_MODEL_KEY = "en"
 
 
 def maybe_download_and_convert_model(model_storage_dir, model_id):
@@ -44,8 +47,9 @@ def maybe_download_and_convert_model(model_storage_dir, model_id):
 
     Checks cache first to avoid re-converting on every endpoint restart.
     A directory is only trusted as "cached" if it actually contains
-    model.bin — a folder that exists but is missing model.bin means a
-    previous conversion was interrupted, and gets removed and redone.
+    model.bin and tokenizer.json — a folder that exists but is missing either
+    means a previous conversion was interrupted (or predates tokenizer.json),
+    and gets removed and redone.
     Conversion happens in a temp dir first, then is atomically renamed into
     place, so a crash mid-conversion can never leave a broken folder at the
     final cache path again.
@@ -59,7 +63,9 @@ def maybe_download_and_convert_model(model_storage_dir, model_id):
     model_path = model_storage_dir / subdir
     print(f"Looking for model at: {model_path}")
 
-    if not (model_path / "model.bin").exists():
+    # A cache entry is only complete with both the weights and tokenizer.json
+    # (entries converted before tokenizer.json was added get redone).
+    if not ((model_path / "model.bin").exists() and (model_path / "tokenizer.json").exists()):
         if model_path.exists():
             print(f"Found incomplete/broken cached directory -- removing: {model_path}")
             shutil.rmtree(model_path)
@@ -73,6 +79,14 @@ def maybe_download_and_convert_model(model_storage_dir, model_id):
         )
         print(f"Converting to CTranslate2 format (float16)...")
         converter.convert(str(tmp_path), quantization="float16", force=True)
+        # faster-whisper needs tokenizer.json next to the model. The fine-tuned
+        # repos don't ship one, and without it faster-whisper falls back to
+        # openai/whisper-tiny's tokenizer, whose special-token ids are off by one
+        # for large-v3 (e.g. <|transcribe|> resolves to large-v3's <|translate|>).
+        # Build it from the model's own tokenizer files instead.
+        from transformers import WhisperTokenizerFast
+        WhisperTokenizerFast.from_pretrained(model_id).save_pretrained(str(tmp_path))
+        print(f"Saved tokenizer.json built from {model_id}")
         tmp_path.rename(model_path)
         print(f"Model successfully converted and saved to {model_path}")
 
@@ -193,7 +207,7 @@ app = modal.App(MODAL_APP_NAME)
 volume = modal.Volume.from_name(MODAL_APP_NAME, create_if_missing=True)
 
 with cuda_image.imports():
-    from fastapi import File, Form
+    from fastapi import File, Form, HTTPException
     import librosa
     import io
     from pathlib import Path
@@ -210,31 +224,37 @@ with cuda_image.imports():
     volumes={MODEL_MOUNT_DIR: volume})
 @modal.concurrent(max_inputs=10)
 class Transcriber:
-    """Whisper transcriber, parametrized by which fine-tuned model to load.
+    """Whisper transcriber serving all models in LANGUAGES.
 
-    `model_key` selects an entry from MODEL_REGISTRY ("en" or "rw"). Modal
-    spins up a separate warm container pool per distinct model_key value, so
-    the English and Kinyarwanda models run on independent GPUs without any
-    duplicated class/code — they're just two parameter values on the same
-    deployed endpoint.
+    Every container loads all models at startup (two large-v3 models in
+    float16 fit comfortably on one L4), and each request picks its model via
+    the `language` form field.
     """
-    model_key: str = modal.parameter(default=DEFAULT_MODEL_KEY)
 
     @modal.enter()
     def enter(self):
-        self.model_id = MODEL_REGISTRY[self.model_key]
-        print(f"Starting WhisperTranscriber initialization - model_key: {self.model_key}, "
-              f"model repository: {self.model_id}")
         model_dir = MODEL_MOUNT_DIR / MODEL_DOWNLOAD_DIR
-        model_path = maybe_download_and_convert_model(model_dir, self.model_id)
-        self.whisper_model = WhisperModel(model_path, device="cuda", compute_type="float16")
-        print("FasterWhisper model successfully loaded and ready")
+        self.whisper_models = {}
+        for language, (model_id, whisper_language) in LANGUAGES.items():
+            print(f"Loading model for language '{language}': {model_id} "
+                  f"(Whisper decode language: {whisper_language})")
+            model_path = maybe_download_and_convert_model(model_dir, model_id)
+            self.whisper_models[language] = WhisperModel(model_path, device="cuda", compute_type="float16")
+        print(f"FasterWhisper models loaded and ready: {list(self.whisper_models)}")
 
     @modal.fastapi_endpoint(docs=True, method="POST")
-    def transcribe(self, wav: bytes = File(), language: str = Form(default=None),
+    def transcribe(self, wav: bytes = File(), language: str = Form(),
                    use_word_timestamps: bool = Form(default=False)):
+        language = language.strip().lower()
+        if language not in LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language '{language}'. Use one of: {sorted(LANGUAGES)}")
+        model_id, whisper_language = LANGUAGES[language]
         audio_array, _ = librosa.load(io.BytesIO(wav), sr=SAMPLE_RATE)
         result = transcribe_with_fasterwhisper(
-            self.whisper_model, audio_array, language,
+            self.whisper_models[language], audio_array, whisper_language,
             get_transcript_only=False, use_word_timestamps=use_word_timestamps)
+        result['language'] = language
+        result['model'] = model_id
         return result
